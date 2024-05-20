@@ -708,6 +708,23 @@ fn multiaddr_to_socketaddr(
         (Protocol::Ip6(ip), Protocol::Udp(port)) => {
             Some((SocketAddr::new(ip.into(), port), version, peer_id))
         }
+        (Protocol::Onion(mac, if_index), Protocol::Udp(port)) => {
+            // This is a very silly hack to be able to get link-local addresses to work. PLEASE DO NOT TRY THIS AT HOME.
+            use std::net::SocketAddrV6;
+
+            let mut ip = [0u8; 16];
+            ip[0] = 0xFE;
+            ip[1] = 0x80;
+
+            ip[8..].copy_from_slice(&mac[..8]);
+
+            let ip = Ipv6Addr::from(ip);
+            Some((
+                SocketAddrV6::new(ip, port, 0, if_index as u32).into(),
+                version,
+                peer_id,
+            ))
+        }
         _ => None,
     }
 }
