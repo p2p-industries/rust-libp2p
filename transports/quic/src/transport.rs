@@ -762,10 +762,27 @@ fn socketaddr_to_multiaddr(socket_addr: &SocketAddr, version: ProtocolVersion) -
         ProtocolVersion::V1 => Protocol::QuicV1,
         ProtocolVersion::Draft29 => Protocol::Quic,
     };
-    Multiaddr::empty()
-        .with(socket_addr.ip().into())
-        .with(Protocol::Udp(socket_addr.port()))
-        .with(quic_proto)
+
+    match socket_addr {
+        SocketAddr::V6(socket_addr) if socket_addr.scope_id() != 0 => {
+            use std::borrow::Cow;
+
+            let mut bytes = [0; 10];
+            bytes[0..8].copy_from_slice(&socket_addr.ip().octets()[8..]);
+
+            Multiaddr::empty()
+                .with(Protocol::Onion(
+                    Cow::Owned(bytes),
+                    socket_addr.scope_id() as u16,
+                ))
+                .with(Protocol::Udp(socket_addr.port()))
+                .with(quic_proto)
+        }
+        _ => Multiaddr::empty()
+            .with(socket_addr.ip().into())
+            .with(Protocol::Udp(socket_addr.port()))
+            .with(quic_proto),
+    }
 }
 
 #[cfg(test)]
