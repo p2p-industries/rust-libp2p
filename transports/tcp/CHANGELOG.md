@@ -1,3 +1,8 @@
+## 0.42.1
+
+- Add support for the `ip6zone` Multiaddr protocol.
+  See [PR 5609](https://github.com/libp2p/rust-libp2p/pull/5609).
+
 ## 0.42.0
 
 - Implement refactored `Transport`.

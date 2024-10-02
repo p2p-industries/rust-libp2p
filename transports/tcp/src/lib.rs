@@ -48,7 +48,7 @@ use socket2::{Domain, Socket, Type};
 use std::{
     collections::{HashSet, VecDeque},
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener},
     pin::Pin,
     sync::{Arc, RwLock},
     task::{Context, Poll, Waker},
@@ -677,20 +677,29 @@ fn multiaddr_to_socketaddr(mut addr: Multiaddr) -> Result<SocketAddr, ()> {
     // ignoring a `/p2p/...` suffix as well as any prefix of possibly
     // outer protocols, if present.
     let mut port = None;
+    let mut if_index = None;
     while let Some(proto) = addr.pop() {
         match proto {
             Protocol::Ip4(ipv4) => match port {
-                Some(port) => return Ok(SocketAddr::new(ipv4.into(), port)),
+                Some(port) => return Ok(SocketAddrV4::new(ipv4, port).into()),
                 None => return Err(()),
             },
             Protocol::Ip6(ipv6) => match port {
-                Some(port) => return Ok(SocketAddr::new(ipv6.into(), port)),
+                Some(port) => {
+                    return Ok(SocketAddrV6::new(ipv6, port, 0, if_index.unwrap_or(0)).into())
+                }
                 None => return Err(()),
             },
             Protocol::Tcp(portnum) => match port {
                 Some(_) => return Err(()),
                 None => port = Some(portnum),
             },
+            Protocol::Ip6zone(zone) => {
+                if_index = zone
+                    .parse()
+                    .ok()
+                    .or_else(|| if_nametoindex(zone.as_ref()).ok());
+            }
             Protocol::P2p(_) => {}
             _ => return Err(()),
         }
@@ -701,6 +710,45 @@ fn multiaddr_to_socketaddr(mut addr: Multiaddr) -> Result<SocketAddr, ()> {
 // Create a [`Multiaddr`] from the given IP address and port number.
 fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
     Multiaddr::empty().with(ip.into()).with(Protocol::Tcp(port))
+}
+
+/// Returns the index of the network interface corresponding to the given name.
+#[cfg(unix)]
+fn if_nametoindex(name: impl Into<Vec<u8>>) -> io::Result<u32> {
+    let if_name = std::ffi::CString::new(name)?;
+    match unsafe { libc::if_nametoindex(if_name.as_ptr()) } {
+        0 => Err(io::Error::last_os_error()),
+        if_index => Ok(if_index),
+    }
+}
+
+/// Returns the name of the network interface corresponding to the given interface index.
+#[cfg(unix)]
+fn if_indextoname(name: u32) -> io::Result<String> {
+    let mut buffer = [0; libc::IF_NAMESIZE];
+    let maybe_name = unsafe { libc::if_indextoname(name, buffer.as_mut_ptr()) };
+    if maybe_name.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        let cstr = unsafe { std::ffi::CStr::from_ptr(maybe_name) };
+        Ok(cstr.to_string_lossy().into_owned())
+    }
+}
+
+#[cfg(not(unix))]
+fn if_nametoindex(name: impl Into<Vec<u8>>) -> io::Result<u32> {
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "if_nametoindex is not supported on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn if_indextoname(name: u32) -> io::Result<String> {
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "if_indextoname is not supported on this platform",
+    ))
 }
 
 #[cfg(test)]
