@@ -722,32 +722,11 @@ fn if_nametoindex(name: impl Into<Vec<u8>>) -> io::Result<u32> {
     }
 }
 
-/// Returns the name of the network interface corresponding to the given interface index.
-#[cfg(unix)]
-fn if_indextoname(name: u32) -> io::Result<String> {
-    let mut buffer = [0; libc::IF_NAMESIZE];
-    let maybe_name = unsafe { libc::if_indextoname(name, buffer.as_mut_ptr()) };
-    if maybe_name.is_null() {
-        Err(io::Error::last_os_error())
-    } else {
-        let cstr = unsafe { std::ffi::CStr::from_ptr(maybe_name) };
-        Ok(cstr.to_string_lossy().into_owned())
-    }
-}
-
 #[cfg(not(unix))]
 fn if_nametoindex(name: impl Into<Vec<u8>>) -> io::Result<u32> {
     Err(io::Error::new(
         io::ErrorKind::Other,
         "if_nametoindex is not supported on this platform",
-    ))
-}
-
-#[cfg(not(unix))]
-fn if_indextoname(name: u32) -> io::Result<String> {
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "if_indextoname is not supported on this platform",
     ))
 }
 
