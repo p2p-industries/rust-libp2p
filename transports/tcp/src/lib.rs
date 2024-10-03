@@ -66,37 +66,35 @@ pub struct Config {
     backlog: u32,
 }
 
-type Port = u16;
-
 /// The configuration for port reuse of listening sockets.
 #[derive(Debug, Clone, Default)]
 struct PortReuse {
     /// The addresses and ports of the listening sockets
     /// registered as eligible for port reuse when dialing
-    listen_addrs: Arc<RwLock<HashSet<(IpAddr, Port)>>>,
+    listen_addrs: Arc<RwLock<HashSet<SocketAddr>>>,
 }
 
 impl PortReuse {
     /// Registers a socket address for port reuse.
     ///
     /// Has no effect if port reuse is disabled.
-    fn register(&mut self, ip: IpAddr, port: Port) {
-        tracing::trace!(%ip, %port, "Registering for port reuse");
+    fn register(&mut self, socket_addr: SocketAddr) {
+        tracing::trace!(%socket_addr, "Registering for port reuse");
         self.listen_addrs
             .write()
             .expect("`register()` and `unregister()` never panic while holding the lock")
-            .insert((ip, port));
+            .insert(socket_addr);
     }
 
     /// Unregisters a socket address for port reuse.
     ///
     /// Has no effect if port reuse is disabled.
-    fn unregister(&mut self, ip: IpAddr, port: Port) {
-        tracing::trace!(%ip, %port, "Unregistering for port reuse");
+    fn unregister(&mut self, socket_addr: SocketAddr) {
+        tracing::trace!(%socket_addr, "Unregistering for port reuse");
         self.listen_addrs
             .write()
             .expect("`register()` and `unregister()` never panic while holding the lock")
-            .remove(&(ip, port));
+            .remove(&socket_addr);
     }
 
     /// Selects a listening socket address suitable for use
@@ -109,17 +107,22 @@ impl PortReuse {
     /// Returns `None` if port reuse is disabled or no suitable
     /// listening socket address is found.
     fn local_dial_addr(&self, remote_ip: &IpAddr) -> Option<SocketAddr> {
-        for (ip, port) in self
+        for socket_addr in self
             .listen_addrs
             .read()
             .expect("`local_dial_addr` never panic while holding the lock")
             .iter()
         {
-            if ip.is_ipv4() == remote_ip.is_ipv4() && ip.is_loopback() == remote_ip.is_loopback() {
+            let mut socket_addr = *socket_addr;
+            if socket_addr.ip().is_ipv4() == socket_addr.ip().is_ipv4()
+                && socket_addr.ip().is_loopback() == socket_addr.ip().is_loopback()
+            {
                 if remote_ip.is_ipv4() {
-                    return Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), *port));
+                    socket_addr.set_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                    return Some(socket_addr);
                 } else {
-                    return Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), *port));
+                    socket_addr.set_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+                    return Some(socket_addr);
                 }
             }
         }
@@ -289,8 +292,8 @@ where
             );
         }
 
-        self.port_reuse.register(local_addr.ip(), local_addr.port());
-        let listen_addr = ip_to_multiaddr(local_addr.ip(), local_addr.port());
+        self.port_reuse.register(local_addr);
+        let listen_addr = ip_to_multiaddr(local_addr);
         self.pending_events.push_back(TransportEvent::NewAddress {
             listener_id: id,
             listen_addr,
@@ -510,13 +513,12 @@ where
         match &self.if_watcher {
             Some(if_watcher) => {
                 for ip_net in T::addrs(if_watcher) {
-                    self.port_reuse
-                        .unregister(ip_net.addr(), self.listen_addr.port());
+                    let mut listen_addr = self.listen_addr;
+                    listen_addr.set_ip(ip_net.addr());
+                    self.port_reuse.unregister(listen_addr);
                 }
             }
-            None => self
-                .port_reuse
-                .unregister(self.listen_addr.ip(), self.listen_addr.port()),
+            None => self.port_reuse.unregister(self.listen_addr),
         }
     }
 
@@ -553,9 +555,12 @@ where
                 Ok(IfEvent::Up(inet)) => {
                     let ip = inet.addr();
                     if self.listen_addr.is_ipv4() == ip.is_ipv4() {
-                        let ma = ip_to_multiaddr(ip, my_listen_addr_port);
+                        let mut a = self.listen_addr;
+                        a.set_ip(ip);
+                        a.set_port(my_listen_addr_port);
+                        let ma = ip_to_multiaddr(a);
                         tracing::debug!(address=%ma, "New listen address");
-                        self.port_reuse.register(ip, my_listen_addr_port);
+                        self.port_reuse.register(a);
                         return Poll::Ready(TransportEvent::NewAddress {
                             listener_id: self.listener_id,
                             listen_addr: ma,
@@ -565,9 +570,12 @@ where
                 Ok(IfEvent::Down(inet)) => {
                     let ip = inet.addr();
                     if self.listen_addr.is_ipv4() == ip.is_ipv4() {
-                        let ma = ip_to_multiaddr(ip, my_listen_addr_port);
+                        let mut a = self.listen_addr;
+                        a.set_ip(ip);
+                        a.set_port(my_listen_addr_port);
+                        let ma = ip_to_multiaddr(a);
                         tracing::debug!(address=%ma, "Expired listen address");
-                        self.port_reuse.unregister(ip, my_listen_addr_port);
+                        self.port_reuse.unregister(a);
                         return Poll::Ready(TransportEvent::AddressExpired {
                             listener_id: self.listener_id,
                             listen_addr: ma,
@@ -636,8 +644,8 @@ where
                 remote_addr,
                 stream,
             })) => {
-                let local_addr = ip_to_multiaddr(local_addr.ip(), local_addr.port());
-                let remote_addr = ip_to_multiaddr(remote_addr.ip(), remote_addr.port());
+                let local_addr = ip_to_multiaddr(local_addr);
+                let remote_addr = ip_to_multiaddr(remote_addr);
 
                 tracing::debug!(
                     remote_address=%remote_addr,
@@ -708,8 +716,22 @@ fn multiaddr_to_socketaddr(mut addr: Multiaddr) -> Result<SocketAddr, ()> {
 }
 
 // Create a [`Multiaddr`] from the given IP address and port number.
-fn ip_to_multiaddr(ip: IpAddr, port: u16) -> Multiaddr {
-    Multiaddr::empty().with(ip.into()).with(Protocol::Tcp(port))
+fn ip_to_multiaddr(socket_addr: SocketAddr) -> Multiaddr {
+    let addr = match socket_addr {
+        SocketAddr::V4(addr) => Multiaddr::empty().with(Protocol::Ip4(addr.ip().to_owned().into())),
+        SocketAddr::V6(addr) => {
+            let mut multi_addr =
+                Multiaddr::empty().with(Protocol::Ip6(addr.ip().to_owned().into()));
+            let zone = addr.scope_id();
+            if zone != 0 {
+                multi_addr.push(Protocol::Ip6zone(
+                    if_indextoname(zone).unwrap_or(zone.to_string()).into(),
+                ));
+            }
+            multi_addr
+        }
+    };
+    addr.with(Protocol::Tcp(socket_addr.port()))
 }
 
 /// Returns the index of the network interface corresponding to the given name.
@@ -728,6 +750,25 @@ fn if_nametoindex(name: impl Into<Vec<u8>>) -> io::Result<u32> {
         io::ErrorKind::Other,
         "if_nametoindex is not supported on this platform",
     ))
+}
+
+/// Returns the name of the network interface corresponding to the given interface index.
+#[cfg(unix)]
+fn if_indextoname(name: u32) -> io::Result<String> {
+    let mut buffer = [0; libc::IF_NAMESIZE];
+    let maybe_name = unsafe { libc::if_indextoname(name, buffer.as_mut_ptr()) };
+    if maybe_name.is_null() {
+        Err(io::Error::last_os_error())
+    } else {
+        let cstr = unsafe { std::ffi::CStr::from_ptr(maybe_name) };
+        Ok(cstr.to_string_lossy().into_owned())
+    }
+}
+
+/// Returns the name of the network interface corresponding to the given interface index.
+#[cfg(not(unix))]
+fn if_indextoname(name: u32) -> io::Result<String> {
+    panic!("if_indextoname is not supported on this platform")
 }
 
 #[cfg(test)]
