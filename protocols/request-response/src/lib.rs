@@ -73,21 +73,6 @@ mod handler;
 #[cfg(feature = "json")]
 pub mod json;
 
-pub use codec::Codec;
-pub use handler::ProtocolSupport;
-
-use crate::handler::OutboundMessage;
-use futures::channel::oneshot;
-use handler::Handler;
-use libp2p_core::{ConnectedPoint, Endpoint, Multiaddr};
-use libp2p_identity::PeerId;
-use libp2p_swarm::{
-    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm},
-    dial_opts::DialOpts,
-    ConnectionDenied, ConnectionHandler, ConnectionId, NetworkBehaviour, NotifyHandler, THandler,
-    THandlerInEvent, THandlerOutEvent, ToSwarm,
-};
-use smallvec::SmallVec;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt, io,
@@ -95,6 +80,22 @@ use std::{
     task::{Context, Poll},
     time::Duration,
 };
+
+pub use codec::Codec;
+use futures::channel::oneshot;
+use handler::Handler;
+pub use handler::ProtocolSupport;
+use libp2p_core::{transport::PortUse, ConnectedPoint, Endpoint, Multiaddr};
+use libp2p_identity::PeerId;
+use libp2p_swarm::{
+    behaviour::{AddressChange, ConnectionClosed, DialFailure, FromSwarm},
+    dial_opts::DialOpts,
+    ConnectionDenied, ConnectionHandler, ConnectionId, NetworkBehaviour, NotifyHandler,
+    PeerAddresses, THandler, THandlerInEvent, THandlerOutEvent, ToSwarm,
+};
+use smallvec::SmallVec;
+
+use crate::handler::OutboundMessage;
 
 /// An inbound request or response.
 #[derive(Debug)]
@@ -353,11 +354,11 @@ where
     /// Pending events to return from `poll`.
     pending_events:
         VecDeque<ToSwarm<Event<TCodec::Request, TCodec::Response>, OutboundMessage<TCodec>>>,
-    /// The currently connected peers, their pending outbound and inbound responses and their known,
-    /// reachable addresses, if any.
+    /// The currently connected peers, their pending outbound and inbound responses and their
+    /// known, reachable addresses, if any.
     connected: HashMap<PeerId, SmallVec<[Connection; 2]>>,
     /// Externally managed addresses via `add_address` and `remove_address`.
-    addresses: HashMap<PeerId, HashSet<Multiaddr>>,
+    addresses: PeerAddresses,
     /// Requests that have not yet been sent and are waiting for a connection
     /// to be established.
     pending_outbound_requests: HashMap<PeerId, SmallVec<[OutboundMessage<TCodec>; 10]>>,
@@ -367,7 +368,8 @@ impl<TCodec> Behaviour<TCodec>
 where
     TCodec: Codec + Default + Clone + Send + 'static,
 {
-    /// Creates a new `Behaviour` for the given protocols and configuration, using [`Default`] to construct the codec.
+    /// Creates a new `Behaviour` for the given protocols and configuration, using [`Default`] to
+    /// construct the codec.
     pub fn new<I>(protocols: I, cfg: Config) -> Self
     where
         I: IntoIterator<Item = (TCodec::Protocol, ProtocolSupport)>,
@@ -406,7 +408,7 @@ where
             pending_events: VecDeque::new(),
             connected: HashMap::new(),
             pending_outbound_requests: HashMap::new(),
-            addresses: HashMap::new(),
+            addresses: PeerAddresses::default(),
         }
     }
 
@@ -470,20 +472,15 @@ where
     ///
     /// Returns true if the address was added, false otherwise (i.e. if the
     /// address is already in the list).
+    #[deprecated(note = "Use `Swarm::add_peer_address` instead.")]
     pub fn add_address(&mut self, peer: &PeerId, address: Multiaddr) -> bool {
-        self.addresses.entry(*peer).or_default().insert(address)
+        self.addresses.add(*peer, address)
     }
 
-    /// Removes an address of a peer previously added via `add_address`.
+    /// Removes an address of a peer previously added via [`Behaviour::add_address`].
+    #[deprecated(note = "Will be removed with the next breaking release and won't be replaced.")]
     pub fn remove_address(&mut self, peer: &PeerId, address: &Multiaddr) {
-        let mut last = false;
-        if let Some(addresses) = self.addresses.get_mut(peer) {
-            addresses.retain(|a| a != address);
-            last = addresses.is_empty();
-        }
-        if last {
-            self.addresses.remove(peer);
-        }
+        self.addresses.remove(peer, address);
     }
 
     /// Checks whether a peer is currently connected.
@@ -698,7 +695,8 @@ where
         }
     }
 
-    /// Preloads a new [`Handler`] with requests that are waiting to be sent to the newly connected peer.
+    /// Preloads a new [`Handler`] with requests that are
+    /// waiting to be sent to the newly connected peer.
     fn preload_new_handler(
         &mut self,
         handler: &mut Handler<TCodec>,
@@ -764,9 +762,9 @@ where
         if let Some(connections) = self.connected.get(&peer) {
             addresses.extend(connections.iter().filter_map(|c| c.remote_address.clone()))
         }
-        if let Some(more) = self.addresses.get(&peer) {
-            addresses.extend(more.iter().cloned());
-        }
+
+        let cached_addrs = self.addresses.get(&peer);
+        addresses.extend(cached_addrs);
 
         Ok(addresses)
     }
@@ -777,6 +775,7 @@ where
         peer: PeerId,
         remote_address: &Multiaddr,
         _: Endpoint,
+        _: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         let mut handler = Handler::new(
             self.inbound_protocols.clone(),
@@ -797,6 +796,7 @@ where
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
+        self.addresses.on_swarm_event(&event);
         match event {
             FromSwarm::ConnectionEstablished(_) => {}
             FromSwarm::ConnectionClosed(connection_closed) => {
